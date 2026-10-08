@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from pyinsteon.constants import ResponseStatus
+from pyinsteon.managers.scene_controller_manager import SceneControllerError
 import pyinsteon.managers.scene_manager
 import pytest
 
@@ -75,7 +76,8 @@ async def test_get_scenes(
         msg = await ws_client.receive_json()
         result = msg["result"]
         assert len(result) == 1
-        assert len(result["20"]) == 3
+        assert result["20"]["controllers"] == []
+        assert result["20"]["pending"] is False
 
 
 async def test_get_scene(
@@ -216,3 +218,135 @@ async def test_delete_scene(
         result = msg["result"]
         assert result["result"]
         assert result["scene_id"] == 20
+
+
+@pytest.mark.parametrize(
+    ("payload", "controllers"),
+    [
+        pytest.param({}, None, id="omitted-preserves-controllers"),
+        pytest.param({"controllers": []}, [], id="empty-removes-controllers"),
+        pytest.param(
+            {"controllers": [{"address": "33.33.33", "group": 3}]},
+            [{"address": "33.33.33", "group": 3}],
+            id="hardware-button",
+        ),
+    ],
+)
+async def test_save_scene_controllers(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    payload: dict[str, object],
+    controllers: list[dict[str, str | int]] | None,
+) -> None:
+    """Forward controller selections without changing their group numbers."""
+    ws_client = await hass_ws_client(hass)
+    async_load_api(hass)
+    save = AsyncMock(return_value=(20, ResponseStatus.SUCCESS))
+    with (
+        patch.object(scenes, "async_add_or_update_scene", save),
+        patch.object(scenes.devices, "async_save"),
+    ):
+        await ws_client.send_json(
+            {
+                ID: 1,
+                TYPE: "insteon/scene/save",
+                "scene_id": 20,
+                "name": "Evening",
+                "links": [],
+                **payload,
+            }
+        )
+        msg = await ws_client.receive_json()
+    assert msg["result"] == {"scene_id": 20, "result": True}
+    save.assert_awaited_once_with(
+        scene_num=20,
+        links=[],
+        name="Evening",
+        work_dir=hass.config.config_dir,
+        controllers=controllers,
+    )
+
+
+async def test_get_scene_controllers(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Expose the logical scene association and interrupted-write status."""
+    ws_client = await hass_ws_client(hass)
+    async_load_api(hass)
+    scene = {
+        "name": "Evening",
+        "group": 20,
+        "devices": {},
+        "controllers": [{"address": "33.33.33", "group": 3}],
+        "pending": True,
+    }
+    with patch.object(scenes, "async_get_scene", AsyncMock(return_value=scene)):
+        await ws_client.send_json({ID: 1, TYPE: "insteon/scene/get", "scene_id": 20})
+        msg = await ws_client.receive_json()
+    assert msg["result"] == scene
+
+
+@pytest.mark.parametrize(
+    ("command", "function", "payload"),
+    [
+        pytest.param(
+            "save",
+            "async_add_or_update_scene",
+            {"name": "Evening", "links": []},
+            id="save-conflict",
+        ),
+        pytest.param("delete", "async_delete_scene", {}, id="delete-missing-device"),
+        pytest.param("get", "async_get_scene", {}, id="get-corrupt-metadata"),
+    ],
+)
+async def test_scene_controller_error(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    command: str,
+    function: str,
+    payload: dict[str, object],
+) -> None:
+    """Return actionable scene errors without reporting success."""
+    ws_client = await hass_ws_client(hass)
+    async_load_api(hass)
+    with patch.object(
+        scenes,
+        function,
+        AsyncMock(
+            side_effect=SceneControllerError("Controller group is already in use")
+        ),
+    ):
+        await ws_client.send_json(
+            {ID: 1, TYPE: f"insteon/scene/{command}", "scene_id": 20, **payload}
+        )
+        msg = await ws_client.receive_json()
+    assert msg["success"] is False
+    assert msg["error"] == {
+        "code": "scene_error",
+        "message": "Controller group is already in use",
+    }
+
+
+@pytest.mark.parametrize("group", [0, 256])
+async def test_invalid_controller_group(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, group: int
+) -> None:
+    """Reject controller groups outside the one-byte hardware range."""
+    ws_client = await hass_ws_client(hass)
+    async_load_api(hass)
+    save = AsyncMock()
+    with patch.object(scenes, "async_add_or_update_scene", save):
+        await ws_client.send_json(
+            {
+                ID: 1,
+                TYPE: "insteon/scene/save",
+                "scene_id": 20,
+                "name": "Evening",
+                "links": [],
+                "controllers": [{"address": "33.33.33", "group": group}],
+            }
+        )
+        msg = await ws_client.receive_json()
+    assert msg["success"] is False
+    assert msg["error"]["code"] == "invalid_format"
+    save.assert_not_awaited()
